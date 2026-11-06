@@ -1,0 +1,5 @@
+export { useMonitoringStore, initMonitoring } from './model/store'
+export { computeKpis } from './lib/kpis'
+export type { PlantKpis } from './lib/kpis'
+export { runPipeline } from './lib/pipeline'
+export { TiltControl } from './ui/TiltControl'
