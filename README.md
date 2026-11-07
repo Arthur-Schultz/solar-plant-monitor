@@ -21,7 +21,7 @@ i18next (pt-BR / en-US) · Vitest · arquitetura **Feature-Sliced Design**.
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 20 testes: física solar + diagnósticos ponta a ponta
+npm test           # 46 testes: física solar, cada falha simulada, chuva, backend da IA
 npm run build      # typecheck + bundle de produção em dist/
 ```
 
@@ -43,11 +43,15 @@ src/
 ├── app/        Bootstrap, estilos globais, ciclo de vida do monitoramento
 ├── pages/      dashboard — compõe widgets, deriva KPIs e diagnósticos (useMemo)
 ├── widgets/    plant-twin (Three.js), generation-chart, kpi-strip, inverter-panel,
-│               diagnostics-panel, string-health, weekly-chart, losses-chart, thermal-chart
+│               diagnostics-panel, string-health, weekly-chart, losses-chart, thermal-chart,
+│               ai-assistant (chat + retrato do painel)
 ├── features/   plant-monitoring (pipeline + store), plant-diagnostics (algoritmos),
+│               fault-injection (simulador de falhas), ai-assistant (store + API do chat),
 │               sun-control (bússola, modo manual × tempo real), language-switch
 ├── entities/   plant (config + modelo físico), weather (Open-Meteo + fallback), telemetry
-└── shared/     lib/solar (física pura), lib/time, api/http (Axios), i18n, ui (EChart, Panel)
+└── shared/     lib/solar (física pura), lib/time, api/http (Axios), i18n, ui (EChart, Panel, Markdown)
+server/
+└── assistant/  plugin Vite (rota /api/assistant), cliente Gemini SSE, prompt e validação
 ```
 
 Regras seguidas: camadas só importam de camadas abaixo; entidades não se importam entre si.
@@ -89,10 +93,53 @@ intervalo. Assim a curva em sino fica coerente no nascer e no pôr do sol.
 | **Perda térmica** | kWh perdidos por aquecimento e temperatura de pico da célula. |
 | **Clipping** | Energia limitada pelo inversor, sinalizada como comportamento de projeto. |
 
-Cenário de demonstração (em `entities/telemetry/api/simulatedSource.ts`): 34 dias sem
-limpeza, string **B3** com −13 % há 4 dias, e **desarme do INV-B por sobretensão** há 3 dias.
-Os testes confirmam que os algoritmos encontram **exatamente** essas falhas e nenhum falso
-positivo numa usina saudável.
+O botão **Cenário demo** do simulador liga sujeira acumulando há 7 dias, hotspot na string
+**B3** e **desarmes do INV-B por sobretensão** há 3 dias.
+
+## Simulador de falhas (`entities/telemetry/model/faults.ts`)
+
+Painel para ligar na mão 13 problemas reais de microgeração, em 4 grupos. Cada falha gera a
+**assinatura** que o defeito real deixa nos dados, não só uma perda fixa:
+
+| Grupo | Falhas | Como aparece nos dados |
+|---|---|---|
+| Sujeira e sombra | sujeira geral, sujeira localizada, sombra de vegetação, sombra de objeto | rampa de perda em todas as strings · perda constante numa string · perda só com Sol baixo · perda numa janela da tarde |
+| Conexões e módulos | MC4 com mau contato, hotspot/trinca, string aberta | quedas intermitentes a zero · perda constante · tensão sem corrente |
+| Inversor e rede | sobretensão na rede, derating, inversor desligado | desarmes repetidos no pico · CA limitado com CC normal · indisponibilidade contínua |
+| Degradação e projeto | PID, envelhecimento, string com módulos a menos | todo o arranjo de um inversor abaixo · perda uniforme estável · tensão menor que as vizinhas |
+
+**Chuva:** a chuva real do Open-Meteo e o evento "chuva forte" do simulador lavam parte da
+sujeira (nada abaixo de 5 mm, até ~80 % acima de 35 mm). O diagnóstico reconhece a limpeza
+natural ("a chuva de 32 mm recuperou ~4 % da geração") e, se houver chuva forte prevista
+para as próximas 48 h, recomenda esperar antes de pagar a limpeza. A maquete 3D mostra
+chuva com céu nublado quando chove (automático, ou pelo botão "Chuva").
+
+Os diagnósticos **não leem** o cenário: classificam a causa só pela telemetria (horário da
+perda, intermitência, tensão, eficiência de conversão). Um teste para cada falha garante que
+ela é encontrada pela assinatura certa e que a usina saudável não gera falso positivo.
+
+## Assistente IA (Google Gemini)
+
+Chat lateral que responde **apenas sobre energia solar** e analisa os dados do painel.
+
+- **Backend embutido no Vite** (`server/assistant/plugin.ts`): rota `POST /api/assistant`
+  que chama o Gemini em streaming (SSE). A chave fica só no processo Node e nunca vai para o
+  navegador.
+- **Contexto**: a cada pergunta o navegador envia um retrato compacto do painel (KPIs,
+  strings, inversores, diagnósticos já traduzidos, eventos, últimos dias). O cenário do
+  simulador **não** é enviado: a IA precisa raciocinar pelos dados.
+- **Escopo e segurança**: o prompt de sistema recusa assuntos fora de energia solar, trata os
+  dados como dados (mitiga prompt injection), cita números do painel e sempre inclui
+  orientações de segurança elétrica (NR-10). A entrada é validada e limitada no servidor.
+
+### Configurar (grátis)
+
+1. Crie uma chave em https://aistudio.google.com/apikey
+2. Copie `.env.example` para `.env.local` e preencha `GEMINI_API_KEY=...`
+3. Rode `npm run dev` (ou o `iniciar.bat`) e clique em **Assistente IA**
+
+`GEMINI_MODEL` permite trocar o modelo (padrão `gemini-3.5-flash`). O `.env.local` já está no
+`.gitignore`.
 
 ## Decisões de engenharia
 

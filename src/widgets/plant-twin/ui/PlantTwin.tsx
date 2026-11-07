@@ -22,6 +22,11 @@ export function PlantTwin({ strings, inverterStatus, expectedDayKwh, now }: Prop
   const host = useRef<HTMLDivElement>(null)
   const scene = useRef<PlantScene | null>(null)
   const [heatmap, setHeatmap] = useState(true)
+  const [rainOverride, setRainOverride] = useState<boolean | null>(null)
+  const rainNow = useMonitoringStore((s) => s.rain.nowMmPerHour)
+  // Automático: chove de verdade (Open-Meteo) ou há uma "chuva forte" simulada hoje
+  const autoRain = rainNow >= 0.2 ? Math.min(1, 0.35 + rainNow / 10) : 0
+  const rain = rainOverride === null ? autoRain : rainOverride ? Math.max(autoRain, 0.65) : 0
   const tilt = useMonitoringStore((s) => s.tiltDeg)
   const selected = useMonitoringStore((s) => s.selectedTarget)
   const select = useMonitoringStore((s) => s.select)
@@ -66,8 +71,9 @@ export function PlantTwin({ strings, inverterStatus, expectedDayKwh, now }: Prop
       inverterStatus,
       selected,
       heatmap,
+      rain,
     })
-  }, [sun.azimuth, sun.elevation, sunPath, tilt, stringHealth, inverterStatus, selected, heatmap])
+  }, [sun.azimuth, sun.elevation, sunPath, tilt, stringHealth, inverterStatus, selected, heatmap, rain])
 
   return (
     <Panel
@@ -76,10 +82,16 @@ export function PlantTwin({ strings, inverterStatus, expectedDayKwh, now }: Prop
       className="twin-panel"
       bodyClassName="twin-body"
       actions={
-        <label className="toggle">
-          <input type="checkbox" checked={heatmap} onChange={(e) => setHeatmap(e.target.checked)} />
-          <span>{t('twin.heatmap')}</span>
-        </label>
+        <div className="twin-toggles">
+          <label className="toggle">
+            <input type="checkbox" checked={rain > 0} onChange={(e) => setRainOverride(e.target.checked)} />
+            <span>{t('twin.rain')}</span>
+          </label>
+          <label className="toggle">
+            <input type="checkbox" checked={heatmap} onChange={(e) => setHeatmap(e.target.checked)} />
+            <span>{t('twin.heatmap')}</span>
+          </label>
+        </div>
       }
     >
       <div className="twin-canvas" ref={host} />

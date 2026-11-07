@@ -16,7 +16,12 @@ export interface SceneState {
   inverterStatus: Record<string, 'producing' | 'standby' | 'fault' | 'offline'>
   selected: string | null
   heatmap: boolean
+  /** Intensidade da chuva 0–1 (0 = sem chuva) */
+  rain: number
 }
+
+const RAIN_DROPS = 4500
+const RAIN_BOX = { x: 70, z: 62, top: 42 }
 
 const HEALTH_EMISSIVE: Record<Health, number> = {
   ok: 0x1c5cab,
@@ -54,6 +59,10 @@ export class PlantScene {
   private frustum = 24
   private disposed = false
   private hovered: string | null = null
+  private rainIntensity = 0
+  private rainMesh: THREE.LineSegments | null = null
+  private rainSpeed: Float32Array | null = null
+  private skyRain = new THREE.Color('#6d7884')
   private skyDay = new THREE.Color('#9cc3e6')
   private skyDusk = new THREE.Color('#e7a47a')
   private skyNight = new THREE.Color('#16223a')
@@ -147,7 +156,8 @@ export class PlantScene {
       if (this.disposed) return
       timer.update(time)
       const dt = timer.getDelta()
-      this.waterTex.offset.x -= dt * 0.035
+      this.waterTex.offset.x -= dt * (0.035 + 0.09 * this.rainIntensity)
+      this.animateRain(dt)
       this.controls.update()
       this.renderer.render(this.scene, this.camera)
     })
@@ -477,6 +487,7 @@ export class PlantScene {
 
   update(state: SceneState) {
     this.applyTilt(state.tiltDeg)
+    this.setRain(state.rain)
     this.applySun(state.sun.azimuth, state.sun.elevation)
     this.applySunPath(state.sunPath)
     this.applyHealth(state)
@@ -518,11 +529,20 @@ export class PlantScene {
     const el = Math.max(-10, elevation)
     const dayFactor = THREE.MathUtils.smoothstep(el, -4, 18)
     const duskFactor = 1 - Math.min(1, Math.abs(el - 4) / 14)
-    this.sunLight.intensity = 3 * THREE.MathUtils.smoothstep(el, -1, 12)
+    const overcast = this.rainIntensity
+    this.sunLight.intensity = 3 * THREE.MathUtils.smoothstep(el, -1, 12) * (1 - 0.8 * overcast)
     this.sunLight.color.set(0xffffff).lerp(new THREE.Color(0xff9a5a), duskFactor * 0.7)
-    this.hemi.intensity = 0.32 + 0.45 * dayFactor
+    this.hemi.intensity = (0.32 + 0.45 * dayFactor) * (1 - 0.15 * overcast)
 
-    const sky = this.skyNight.clone().lerp(this.skyDay, dayFactor).lerp(this.skyDusk, duskFactor * 0.55)
+    const sky = this.skyNight
+      .clone()
+      .lerp(this.skyDay, dayFactor)
+      .lerp(this.skyDusk, duskFactor * 0.55 * (1 - overcast))
+      .lerp(this.skyRain.clone().multiplyScalar(0.25 + 0.75 * dayFactor), overcast * 0.85)
+    const fog = this.scene.fog as THREE.Fog
+    fog.near = 120 - 40 * overcast
+    fog.far = 260 - 70 * overcast
+    this.sunMesh.visible = this.sunMesh.visible && overcast < 0.5
     this.scene.background = sky
     ;(this.scene.fog as THREE.Fog).color.copy(sky)
     ;(this.sunMesh.material as THREE.MeshBasicMaterial).color.set(0xffe08a).lerp(new THREE.Color(0xff8a4a), duskFactor)
@@ -559,6 +579,61 @@ export class PlantScene {
   }
 
   private lastState: SceneState | null = null
+
+  // ---------------------------------------------------------------- chuva
+
+  private buildRain() {
+    const positions = new Float32Array(RAIN_DROPS * 6)
+    this.rainSpeed = new Float32Array(RAIN_DROPS)
+    for (let i = 0; i < RAIN_DROPS; i++) {
+      const x = (Math.random() * 2 - 1) * RAIN_BOX.x
+      const z = (Math.random() * 2 - 1) * RAIN_BOX.z + 4
+      const y = Math.random() * RAIN_BOX.top
+      const len = 0.9 + Math.random() * 0.8
+      positions.set([x, y, z, x + 0.12, y + len, z - 0.05], i * 6)
+      this.rainSpeed[i] = 26 + Math.random() * 12
+    }
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    const mat = new THREE.LineBasicMaterial({ color: 0xc9dcef, transparent: true, opacity: 0.55, depthWrite: false })
+    this.rainMesh = new THREE.LineSegments(geo, mat)
+    this.rainMesh.frustumCulled = false
+    this.scene.add(this.rainMesh)
+  }
+
+  private setRain(intensity: number) {
+    this.rainIntensity = Math.max(0, Math.min(1, intensity))
+    if (this.rainIntensity > 0 && !this.rainMesh) this.buildRain()
+    if (this.rainMesh) {
+      this.rainMesh.visible = this.rainIntensity > 0
+      this.rainMesh.geometry.setDrawRange(0, Math.round(RAIN_DROPS * (0.25 + 0.75 * this.rainIntensity)) * 2)
+      ;(this.rainMesh.material as THREE.LineBasicMaterial).opacity = 0.3 + 0.35 * this.rainIntensity
+    }
+  }
+
+  private animateRain(dt: number) {
+    if (!this.rainMesh || !this.rainSpeed || this.rainIntensity <= 0) return
+    const attr = this.rainMesh.geometry.getAttribute('position') as THREE.BufferAttribute
+    const arr = attr.array as Float32Array
+    const step = Math.min(dt, 0.05)
+    for (let i = 0; i < RAIN_DROPS; i++) {
+      const o = i * 6
+      const dy = this.rainSpeed[i] * step
+      arr[o + 1] -= dy
+      arr[o + 4] -= dy
+      arr[o] -= dy * 0.12
+      arr[o + 3] -= dy * 0.12
+      if (arr[o + 1] < 0) {
+        const len = arr[o + 4] - arr[o + 1]
+        const x = (Math.random() * 2 - 1) * RAIN_BOX.x
+        arr[o] = x
+        arr[o + 3] = x + 0.12
+        arr[o + 1] = RAIN_BOX.top
+        arr[o + 4] = RAIN_BOX.top + len
+      }
+    }
+    attr.needsUpdate = true
+  }
 
   // ---------------------------------------------------------------- interação
 

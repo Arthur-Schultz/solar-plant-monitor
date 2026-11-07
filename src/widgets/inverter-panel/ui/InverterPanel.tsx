@@ -70,7 +70,7 @@ export function InverterPanel({ measured, events, now }: Props) {
         <p className="muted">{t('inverter.noEvents')}</p>
       ) : (
         <ul className="events">
-          {[...events].reverse().map((e) => (
+          {[...events].reverse().slice(0, 6).map((e) => (
             <li key={`${e.t}-${e.code}`}>
               <StatusBadge level={e.severity === 'critical' ? 'critical' : e.severity === 'warning' ? 'warning' : 'info'} label={e.code} />
               <span className="events__time">{fmt.dateTime(e.t)}</span>
@@ -79,6 +79,7 @@ export function InverterPanel({ measured, events, now }: Props) {
           ))}
         </ul>
       )}
+      {events.length > 6 && <p className="muted small events__more">{t('inverter.moreEvents', { count: events.length - 6 })}</p>}
     </Panel>
   )
 }

@@ -1,8 +1,8 @@
 import { create } from 'zustand'
 import { PLANT, type ExpectedSample } from '@/entities/plant'
-import type { InverterEvent, TelemetrySample } from '@/entities/telemetry'
+import { useFaultStore, type InverterEvent, type TelemetrySample } from '@/entities/telemetry'
 import { useWeatherStore } from '@/entities/weather'
-import { runPipeline } from '../lib/pipeline'
+import { runPipeline, type RainInfo } from '../lib/pipeline'
 
 interface MonitoringState {
   tiltDeg: number
@@ -11,6 +11,7 @@ interface MonitoringState {
   expected: ExpectedSample[]
   measured: TelemetrySample[]
   events: InverterEvent[]
+  rain: RainInfo
   /** String/inversor destacado (sincroniza maquete 3D ↔ tabela ↔ diagnósticos) */
   selectedTarget: string | null
   setTilt: (deg: number) => void
@@ -28,6 +29,7 @@ export const useMonitoringStore = create<MonitoringState>((set, get) => ({
   expected: [],
   measured: [],
   events: [],
+  rain: { byDay: new Map(), forecast: [], nowMmPerHour: 0 },
   selectedTarget: null,
 
   setTilt(deg) {
@@ -50,7 +52,8 @@ export const useMonitoringStore = create<MonitoringState>((set, get) => ({
     if (!weather.length) return
     const id = ++runId
     const { tiltDeg, now } = get()
-    const result = await runPipeline(PLANT, weather, tiltDeg, now)
+    const faults = useFaultStore.getState().faults
+    const result = await runPipeline(PLANT, weather, tiltDeg, now, { faults, noise: 0.012 })
     if (id !== runId) return // descarta resultado obsoleto (troca rápida de inclinação)
     set({ ...result, ready: true })
   },
@@ -61,10 +64,14 @@ export function initMonitoring(): () => void {
   const unsub = useWeatherStore.subscribe((s, prev) => {
     if (s.samples !== prev.samples) void useMonitoringStore.getState().recompute()
   })
+  const unsubFaults = useFaultStore.subscribe((s, prev) => {
+    if (s.faults !== prev.faults) void useMonitoringStore.getState().recompute()
+  })
   void useWeatherStore.getState().load(PLANT.latitude, PLANT.longitude, PLANT.timezone)
   const timer = window.setInterval(() => useMonitoringStore.getState().tick(), 60_000)
   return () => {
     unsub()
+    unsubFaults()
     window.clearInterval(timer)
   }
 }

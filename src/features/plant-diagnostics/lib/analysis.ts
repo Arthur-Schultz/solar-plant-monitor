@@ -1,7 +1,15 @@
 import { effectiveValuePerKwh, type ExpectedSample, type PlantConfig } from '@/entities/plant'
 import type { InverterEvent, TelemetrySample } from '@/entities/telemetry'
-import { DAY, HOUR, MINUTE, startOfLocalDay } from '@/shared/lib/time'
-import type { DailyPerformance, Diagnostic, Severity, StringHealth } from '../model/types'
+import { DAY, HOUR, MINUTE, localHour, startOfLocalDay } from '@/shared/lib/time'
+import type {
+  DailyPerformance,
+  Diagnostic,
+  InverterCause,
+  InverterHealth,
+  Severity,
+  StringCause,
+  StringHealth,
+} from '../model/types'
 
 const STEP_H = 0.25 // amostras de 15 min → 0,25 h
 
@@ -12,6 +20,16 @@ export const median = (xs: number[]) => {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
 }
 
+/** Quantil por interpolação linear (q entre 0 e 1). */
+export const quantile = (xs: number[], q: number) => {
+  if (!xs.length) return NaN
+  const s = [...xs].sort((a, b) => a - b)
+  const pos = (s.length - 1) * q
+  const lo = Math.floor(pos)
+  const hi = Math.ceil(pos)
+  return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+}
+
 function pair(expected: ExpectedSample[], measured: TelemetrySample[]) {
   const byT = new Map(measured.map((m) => [m.t, m]))
   return expected
@@ -19,13 +37,12 @@ function pair(expected: ExpectedSample[], measured: TelemetrySample[]) {
     .filter((p): p is { e: ExpectedSample; m: TelemetrySample } => !!p.m)
 }
 
-const allProducing = (m: TelemetrySample) =>
-  Object.values(m.inverters).every((i) => i.status !== 'fault' && i.status !== 'offline')
+const producing = (m: TelemetrySample, inverterId: string) => m.inverters[inverterId]?.status === 'producing'
 
 /**
- * Desempenho diário. A razão "limpa" usa só intervalos com POA > 400 W/m², inversores
- * operando e a MEDIANA entre strings — robusta a uma string com defeito e a desarmes,
- * isolando o efeito que atinge todos os módulos por igual: a sujeira.
+ * Desempenho diário. A razão "limpa" usa intervalos com POA > 400 W/m², só strings cujo
+ * inversor está operando, e o QUANTIL 75 % entre strings: a sujeira atinge todos os módulos,
+ * enquanto defeitos atingem uma string ou um inversor — o quantil alto ignora esses casos.
  */
 export function dailyPerformance(
   plant: PlantConfig,
@@ -33,6 +50,7 @@ export function dailyPerformance(
   measured: TelemetrySample[],
 ): DailyPerformance[] {
   const dcKwp = plant.strings.reduce((a, s) => a + s.modules * plant.module.pmaxW, 0) / 1000
+  const invOf = new Map(plant.strings.map((s) => [s.id, s.inverterId]))
   const days = new Map<number, { exp: number; meas: number; poa: number; num: number; den: number }>()
 
   for (const { e, m } of pair(expected, measured)) {
@@ -43,13 +61,13 @@ export function dailyPerformance(
     d.meas += (measAc / 1000) * STEP_H
     d.poa += (e.poa / 1000) * STEP_H
 
-    if (e.poa > 400 && allProducing(m)) {
+    if (e.poa > 400) {
       const ratios = e.strings
-        .filter((s) => s.dcW > 50)
+        .filter((s) => s.dcW > 50 && producing(m, invOf.get(s.stringId)!))
         .map((s) => (m.strings[s.stringId]?.dcW ?? 0) / s.dcW)
-      if (ratios.length) {
+      if (ratios.length >= 3) {
         const totalExp = e.strings.reduce((a, s) => a + s.dcW, 0)
-        d.num += median(ratios) * totalExp
+        d.num += quantile(ratios, 0.75) * totalExp
         d.den += totalExp
       }
     }
@@ -86,6 +104,8 @@ export function linearSlope(xs: number[], ys: number[]): number {
 export interface SoilingAssessment {
   lossPct: number
   trendPctPerDay: number
+  /** Perda uniforme sem tendência de piora: mais compatível com degradação do que sujeira */
+  stable: boolean
   lostKwhPerDay: number
   lostRsPerDay: number
   cleaningPaybackDays: number
@@ -95,9 +115,11 @@ export interface SoilingAssessment {
 export function assessSoiling(plant: PlantConfig, daily: DailyPerformance[]): SoilingAssessment | null {
   const valid = daily.filter((d) => d.cleanRatio !== null)
   if (!valid.length) return null
-  const recent = valid.slice(-2).map((d) => 1 - (d.cleanRatio as number))
+  // Correção de viés: o quantil 75 % de amostras com ruído fica ~0,8 % acima da mediana
+  const recent = valid.slice(-2).map((d) => 1 - (d.cleanRatio as number) + 0.008)
   const lossPct = Math.max(0, median(recent) * 100)
   const trendPctPerDay = -linearSlope(valid.map((_, i) => i), valid.map((d) => d.cleanRatio as number)) * 100
+  const stable = valid.length >= 4 && Math.abs(trendPctPerDay) < 0.12 && lossPct >= 3
 
   const avgExpected = daily.slice(-7).reduce((a, d) => a + d.expectedKwh, 0) / Math.min(7, daily.length)
   const lostKwhPerDay = avgExpected * (lossPct / 100)
@@ -109,13 +131,16 @@ export function assessSoiling(plant: PlantConfig, daily: DailyPerformance[]): So
       : lossPct >= 4 || cleaningPaybackDays <= 30 ? 'warning'
         : lossPct >= 2 ? 'info' : 'ok'
 
-  return { lossPct, trendPctPerDay, lostKwhPerDay, lostRsPerDay, cleaningPaybackDays, severity }
+  return { lossPct, trendPctPerDay, stable, lostKwhPerDay, lostRsPerDay, cleaningPaybackDays, severity }
 }
+
+type Acc = { exp: number; meas: number }
+const ratio = (a?: Acc) => (a && a.exp > 0 ? a.meas / a.exp : NaN)
 
 /**
  * Saúde das strings: compara cada string com o PRÓPRIO valor esperado (que já inclui a
- * sombra da fileira da frente) e depois com a mediana do mesmo inversor. Comparar
- * potências brutas entre strings geraria falso positivo nas fileiras sombreadas.
+ * sombra da fileira da frente) e depois com a mediana do mesmo inversor. Além do desvio
+ * médio, extrai a ASSINATURA do defeito (horário, intermitência, tensão) para sugerir a causa.
  */
 export function stringHealth(
   plant: PlantConfig,
@@ -124,39 +149,213 @@ export function stringHealth(
   from: number,
   to: number,
 ): StringHealth[] {
-  const acc = new Map<string, { exp: number; meas: number }>()
+  const pi = new Map<string, Acc>()
+  const periods = new Map<string, Record<'morning' | 'midday' | 'afternoon' | 'lowSun', Acc>>()
+  const volts = new Map<string, number[]>()
+  const drops = new Map<string, { n: number; total: number; streak: number }>()
+  const energy = new Map<string, number>()
+  const invOf = new Map(plant.strings.map((s) => [s.id, s.inverterId]))
+
   for (const { e, m } of pair(expected, measured)) {
-    if (e.t < from || e.t > to || e.poa < 300 || !allProducing(m)) continue
+    if (e.t < from || e.t > to) continue
+    for (const [id, r] of Object.entries(m.strings)) energy.set(id, (energy.get(id) ?? 0) + (r.dcW / 1000) * STEP_H)
+    if (e.poa < 60) continue
+
+    const h = localHour(e.t, plant.timezone)
+    const period = h < 10 ? 'morning' : h < 14 ? 'midday' : 'afternoon'
+    const ratiosByInv = new Map<string, number[]>()
+
     for (const s of e.strings) {
-      const a = acc.get(s.stringId) ?? { exp: 0, meas: 0 }
-      a.exp += s.dcW
-      a.meas += m.strings[s.stringId]?.dcW ?? 0
-      acc.set(s.stringId, a)
+      const inv = invOf.get(s.stringId)!
+      if (!producing(m, inv) || s.dcW < 50) continue
+      const meas = m.strings[s.stringId]
+      const p = periods.get(s.stringId) ?? { morning: { exp: 0, meas: 0 }, midday: { exp: 0, meas: 0 }, afternoon: { exp: 0, meas: 0 }, lowSun: { exp: 0, meas: 0 } }
+      if (e.poa >= 100) {
+        p[period].exp += s.dcW
+        p[period].meas += meas?.dcW ?? 0
+      }
+      // Sol baixo (< 30°): onde aparece a sombra de vegetação e da fileira da frente
+      if (e.sunElevation < 30) {
+        p.lowSun.exp += s.dcW
+        p.lowSun.meas += meas?.dcW ?? 0
+      }
+      periods.set(s.stringId, p)
+
+      if (e.poa >= 300) {
+        const a = pi.get(s.stringId) ?? { exp: 0, meas: 0 }
+        a.exp += s.dcW
+        a.meas += meas?.dcW ?? 0
+        pi.set(s.stringId, a)
+        if (meas && meas.currentA > 0.5) volts.set(s.stringId, [...(volts.get(s.stringId) ?? []), meas.voltageV])
+        const list = ratiosByInv.get(inv) ?? []
+        list.push((meas?.dcW ?? 0) / s.dcW)
+        ratiosByInv.set(inv, list)
+      }
+    }
+
+    // Intermitência: string cai a ~0 enquanto as vizinhas do mesmo inversor geram normal
+    if (e.poa >= 300) {
+      for (const s of e.strings) {
+        const inv = invOf.get(s.stringId)!
+        const peers = ratiosByInv.get(inv)
+        if (!peers || peers.length < 3) continue
+        const r = (m.strings[s.stringId]?.dcW ?? 0) / Math.max(1, s.dcW)
+        const d = drops.get(s.stringId) ?? { n: 0, total: 0, streak: 0 }
+        d.total++
+        const dropped = r < 0.15 && median(peers) > 0.6
+        if (dropped) d.n++
+        // Sequência atual de zeros: distingue circuito ABERTO (zero contínuo até agora) de intermitência
+        d.streak = dropped ? d.streak + 1 : 0
+        drops.set(s.stringId, d)
+      }
     }
   }
 
-  const energy = new Map<string, number>()
-  for (const { m } of pair(expected, measured)) {
-    if (m.t < from || m.t > to) continue
-    for (const [id, r] of Object.entries(m.strings)) energy.set(id, (energy.get(id) ?? 0) + (r.dcW / 1000) * STEP_H)
+  const base = plant.strings.map((s) => ({
+    s,
+    pi: ratio(pi.get(s.id)),
+    v: median(volts.get(s.id) ?? []),
+    per: periods.get(s.id),
+  }))
+
+  const peerMedian = (s: (typeof base)[number], pick: (x: (typeof base)[number]) => number) => {
+    const vals = base.filter((p) => p.s.inverterId === s.s.inverterId && !Number.isNaN(pick(p))).map(pick)
+    return median(vals)
   }
 
-  const pis = plant.strings.map((s) => {
-    const a = acc.get(s.id)
-    return { s, pi: a && a.exp > 0 ? a.meas / a.exp : NaN }
+  return base.map((b) => {
+    const refPi = peerMedian(b, (x) => x.pi)
+    const deviation = Number.isNaN(b.pi) || !refPi ? 0 : b.pi / refPi - 1
+    const refV = peerMedian(b, (x) => x.v)
+    const voltageDeviation = Number.isNaN(b.v) || !refV ? 0 : b.v / refV - 1
+    const d = drops.get(b.s.id)
+    const intermittency = d && d.total ? d.n / d.total : 0
+
+    const periodDev = (key: 'morning' | 'midday' | 'afternoon' | 'lowSun') => {
+      const own = ratio(b.per?.[key])
+      const ref = peerMedian(b, (x) => ratio(x.per?.[key]))
+      return Number.isNaN(own) || !ref ? 0 : own / ref - 1
+    }
+    const byPeriod = {
+      morning: periodDev('morning'),
+      midday: periodDev('midday'),
+      afternoon: periodDev('afternoon'),
+      lowSun: periodDev('lowSun'),
+    }
+
+    let cause: StringCause = 'none'
+    let status: Severity = 'ok'
+    const piValue = Number.isNaN(b.pi) ? 0 : b.pi
+    const openNow = (d?.streak ?? 0) >= 6 && (d?.n ?? 0) / Math.max(1, d?.streak ?? 1) < 1.5
+    if ((!Number.isNaN(b.pi) && b.pi < 0.05) || openNow) {
+      cause = 'open'
+      status = 'critical'
+    } else if (intermittency >= 0.03) {
+      cause = 'intermittent'
+      status = intermittency >= 0.1 ? 'critical' : 'warning'
+    } else if (voltageDeviation <= -0.03) {
+      cause = 'low-voltage'
+      status = 'warning'
+    } else if (byPeriod.midday > -0.04 && byPeriod.lowSun <= -0.1) {
+      cause = 'shading-low-sun'
+      status = 'warning'
+    } else if (byPeriod.afternoon <= -0.1 && byPeriod.morning > -0.04) {
+      cause = 'shading-afternoon'
+      status = 'warning'
+    } else if (byPeriod.morning <= -0.1 && byPeriod.afternoon > -0.04) {
+      cause = 'shading-morning'
+      status = 'warning'
+    } else if (deviation <= -0.06) {
+      cause = 'constant-loss'
+      status = deviation <= -0.15 ? 'critical' : 'warning'
+    }
+
+    return {
+      stringId: b.s.id,
+      inverterId: b.s.inverterId,
+      performanceIndex: piValue,
+      deviation,
+      voltageDeviation,
+      intermittency,
+      byPeriod,
+      energyKwh: energy.get(b.s.id) ?? 0,
+      cause,
+      status,
+    }
+  })
+}
+
+/**
+ * Saúde dos inversores: separa perda na CONVERSÃO (CA/CC abaixo da eficiência esperada →
+ * derating por temperatura, falha interna) de perda no ARRANJO inteiro (CC baixo em todas
+ * as strings do inversor ao mesmo tempo → PID, degradação, sujeira só daquele lado).
+ */
+export function inverterHealth(
+  plant: PlantConfig,
+  expected: ExpectedSample[],
+  measured: TelemetrySample[],
+  strings: StringHealth[],
+  from: number,
+  to: number,
+): InverterHealth[] {
+  const acc = new Map<string, { expAc: number; measAc: number; expDc: number; measDc: number; effExpAc: number; effExpDc: number; effMeasAc: number; effMeasDc: number }>()
+
+  for (const { e, m } of pair(expected, measured)) {
+    if (e.t < from || e.t > to || e.poa < 400) continue
+    for (const inv of plant.inverters) {
+      if (!producing(m, inv.id)) continue
+      const a = acc.get(inv.id) ?? { expAc: 0, measAc: 0, expDc: 0, measDc: 0, effExpAc: 0, effExpDc: 0, effMeasAc: 0, effMeasDc: 0 }
+      const expDc = e.strings.filter((s) => plant.strings.find((x) => x.id === s.stringId)?.inverterId === inv.id).reduce((x, s) => x + s.dcW, 0)
+      const r = m.inverters[inv.id]
+      a.expAc += e.inverterAcW[inv.id]
+      a.measAc += r.acW
+      a.expDc += expDc
+      a.measDc += r.dcW
+      if (e.inverterAcW[inv.id] > 0.5 * inv.pacMaxW) {
+        a.effExpAc += e.inverterAcW[inv.id]
+        a.effExpDc += expDc
+        a.effMeasAc += r.acW
+        a.effMeasDc += r.dcW
+      }
+      acc.set(inv.id, a)
+    }
+  }
+
+  const base = plant.inverters.map((inv) => {
+    const a = acc.get(inv.id)
+    return {
+      id: inv.id,
+      ac: a && a.expAc ? a.measAc / a.expAc : NaN,
+      dc: a && a.expDc ? a.measDc / a.expDc : NaN,
+      // Eficiência de conversão medida ÷ esperada, só em carga alta (onde o derating aparece)
+      eff: a && a.effMeasDc && a.effExpDc && a.effExpAc ? a.effMeasAc / a.effMeasDc / (a.effExpAc / a.effExpDc) : NaN,
+    }
   })
 
-  return pis.map(({ s, pi }) => {
-    const peers = pis.filter((p) => p.s.inverterId === s.inverterId && !Number.isNaN(p.pi)).map((p) => p.pi)
-    const ref = median(peers)
-    const deviation = Number.isNaN(pi) || !ref ? 0 : pi / ref - 1
-    const status: Severity = deviation <= -0.15 ? 'critical' : deviation <= -0.06 ? 'warning' : 'ok'
+  return base.map((b) => {
+    const others = base.filter((o) => o.id !== b.id && !Number.isNaN(o.ac))
+    const refAc = others.length ? median(others.map((o) => o.ac)) : NaN
+    const refDc = others.length ? median(others.map((o) => o.dc)) : NaN
+    const acDeviation = Number.isNaN(b.ac) || Number.isNaN(refAc) ? 0 : b.ac / refAc - 1
+    const dcDeviation = Number.isNaN(b.dc) || Number.isNaN(refDc) ? 0 : b.dc / refDc - 1
+    const ownStringsOk = strings.filter((s) => s.inverterId === b.id).every((s) => s.status === 'ok')
+
+    let cause: InverterCause = 'none'
+    let status: Severity = 'ok'
+    if (!Number.isNaN(b.eff) && b.eff < 0.94) {
+      cause = 'conversion'
+      status = b.eff < 0.85 ? 'critical' : 'warning'
+    } else if (dcDeviation <= -0.05 && ownStringsOk) {
+      cause = 'array-wide'
+      status = dcDeviation <= -0.12 ? 'critical' : 'warning'
+    }
     return {
-      stringId: s.id,
-      inverterId: s.inverterId,
-      performanceIndex: Number.isNaN(pi) ? 0 : pi,
-      deviation,
-      energyKwh: energy.get(s.id) ?? 0,
+      inverterId: b.id,
+      acRatio: Number.isNaN(b.ac) ? 0 : b.ac,
+      dcRatio: Number.isNaN(b.dc) ? 0 : b.dc,
+      acDeviation,
+      dcDeviation,
+      cause,
       status,
     }
   })
@@ -173,7 +372,7 @@ export function stringDeviationOnset(
   let onset: number | null = null
   for (const day of [...days].reverse()) {
     const h = stringHealth(plant, expected, measured, day, day + DAY).find((x) => x.stringId === stringId)
-    if (h && h.deviation <= -0.06) onset = day
+    if (h && h.status !== 'ok') onset = day
     else if (onset !== null) break
   }
   return onset
@@ -200,40 +399,85 @@ export function detectOutages(expected: ExpectedSample[], measured: TelemetrySam
           cur.end = e.t + 15 * MINUTE
           cur.lostKwh += (expW / 1000) * STEP_H
         } else open.set(invId, { inverterId: invId, start: e.t, end: e.t + 15 * MINUTE, lostKwh: (expW / 1000) * STEP_H })
-      } else if (cur) {
+      } else if (cur && expW > 1500) {
         outages.push(cur)
         open.delete(invId)
       }
     }
   }
-  return [...outages, ...open.values()]
+  return [...outages, ...open.values()].sort((a, b) => a.start - b.start)
+}
+
+const STRING_MESSAGE: Record<Exclude<StringCause, 'none'>, string> = {
+  open: 'diag.string.open',
+  intermittent: 'diag.string.intermittent',
+  'low-voltage': 'diag.string.lowVoltage',
+  'shading-low-sun': 'diag.string.shadingLowSun',
+  'shading-morning': 'diag.string.shadingMorning',
+  'shading-afternoon': 'diag.string.shadingAfternoon',
+  'constant-loss': 'diag.string.message',
 }
 
 /** Monta a lista de diagnósticos exibida no painel (texto resolvido via i18n na UI). */
+export interface RainObservation {
+  byDay: Map<number, number>
+  forecast: { day: number; mm: number }[]
+}
+
+/**
+ * Lavagem natural: compara a razão "limpa" do dia anterior com a do dia seguinte a cada
+ * chuva relevante. Devolve a chuva mais recente que recuperou geração de forma mensurável.
+ */
+export function detectRainWash(daily: DailyPerformance[], rain: RainObservation | undefined) {
+  if (!rain) return null
+  const byDay = new Map(daily.map((d) => [d.day, d.cleanRatio]))
+  let best: { day: number; mm: number; gainPct: number } | null = null
+  for (const [day, mm] of rain.byDay) {
+    if (mm < 8) continue
+    const before = byDay.get(day - DAY)
+    const after = byDay.get(day + DAY)
+    if (before == null || after == null) continue
+    const gainPct = (after - before) * 100
+    if (gainPct >= 1.2 && (!best || day > best.day)) best = { day, mm, gainPct }
+  }
+  return best
+}
+
 export function buildDiagnostics(args: {
   plant: PlantConfig
   expected: ExpectedSample[]
   measured: TelemetrySample[]
   events: InverterEvent[]
   now: number
-}): { diagnostics: Diagnostic[]; daily: DailyPerformance[]; strings: StringHealth[]; soiling: SoilingAssessment | null; outages: Outage[] } {
-  const { plant, expected, measured, now } = args
+  rain?: RainObservation
+}) {
+  const { plant, expected, measured, now, rain } = args
   const today = startOfLocalDay(now, plant.timezone)
+  const value = effectiveValuePerKwh(plant.economics)
   const daily = dailyPerformance(plant, expected, measured)
   const soiling = assessSoiling(plant, daily)
   // Janela de 2 dias: dados suficientes mesmo de manhã cedo
   const strings = stringHealth(plant, expected, measured, today - DAY, now)
+  const inverters = inverterHealth(plant, expected, measured, strings, today - DAY, now)
   const outages = detectOutages(expected, measured)
   const diagnostics: Diagnostic[] = []
 
+  // Chuva relevante prevista nas próximas 48 h: pode adiar (ou dispensar) a limpeza paga
+  const rainSoon = rain?.forecast.find((f) => f.day <= today + DAY && f.mm >= 10) ?? null
+  const washed = detectRainWash(daily, rain)
+
   if (soiling) {
+    const waitRain = !!rainSoon && soiling.severity !== 'ok' && !soiling.stable
+    const key = soiling.severity === 'ok' ? 'ok' : soiling.stable ? 'stable' : waitRain ? 'waitRain' : 'message'
     diagnostics.push({
       id: 'soiling',
       kind: 'soiling',
-      severity: soiling.severity,
-      titleKey: soiling.severity === 'ok' ? 'diag.soiling.okTitle' : 'diag.soiling.title',
-      messageKey: soiling.severity === 'ok' ? 'diag.soiling.ok' : 'diag.soiling.message',
+      severity: waitRain ? 'info' : soiling.severity,
+      titleKey: `diag.soiling.${key === 'message' ? 'title' : `${key}Title`}`,
+      messageKey: `diag.soiling.${key}`,
       params: {
+        rainMm: Math.round(rainSoon?.mm ?? 0),
+        rainDay: rainSoon?.day ?? today,
         loss: soiling.lossPct.toFixed(1),
         trend: soiling.trendPctPerDay.toFixed(2),
         rsDay: soiling.lostRsPerDay.toFixed(2),
@@ -243,35 +487,110 @@ export function buildDiagnostics(args: {
     })
   }
 
-  for (const s of strings.filter((x) => x.status !== 'ok')) {
+  if (washed) {
+    diagnostics.push({
+      id: 'rain-wash',
+      kind: 'soiling',
+      severity: 'info',
+      titleKey: 'diag.rain.washTitle',
+      messageKey: 'diag.rain.wash',
+      params: { mm: Math.round(washed.mm), day: washed.day, gain: washed.gainPct.toFixed(1) },
+    })
+  }
+
+  for (const s of strings.filter((x) => x.status !== 'ok' && x.cause !== 'none')) {
     const onset = stringDeviationOnset(plant, expected, measured, s.stringId, daily.map((d) => d.day))
     diagnostics.push({
       id: `string-${s.stringId}`,
       kind: 'string-mismatch',
       severity: s.status,
-      titleKey: 'diag.string.title',
-      messageKey: 'diag.string.message',
-      params: { string: s.stringId, inverter: s.inverterId, dev: (s.deviation * 100).toFixed(1), since: onset ?? now },
+      titleKey: s.cause === 'open' ? 'diag.string.openTitle' : 'diag.string.title',
+      messageKey: STRING_MESSAGE[s.cause as Exclude<StringCause, 'none'>],
+      params: {
+        string: s.stringId,
+        inverter: s.inverterId,
+        dev: Math.abs(s.deviation * 100).toFixed(1),
+        vdev: Math.abs(s.voltageDeviation * 100).toFixed(1),
+        drops: (s.intermittency * 100).toFixed(0),
+        morning: Math.abs(s.byPeriod.morning * 100).toFixed(0),
+        lowSun: Math.abs(s.byPeriod.lowSun * 100).toFixed(0),
+        afternoon: Math.abs(s.byPeriod.afternoon * 100).toFixed(0),
+        since: onset ?? today,
+      },
       target: s.stringId,
     })
   }
 
-  for (const o of outages.filter((x) => x.end > now - 7 * DAY)) {
+  for (const inv of inverters.filter((x) => x.status !== 'ok')) {
     diagnostics.push({
-      id: `outage-${o.inverterId}-${o.start}`,
-      kind: 'outage',
-      severity: o.end > now - HOUR ? 'critical' : 'warning',
-      titleKey: 'diag.outage.title',
-      messageKey: 'diag.outage.message',
+      id: `inverter-${inv.inverterId}`,
+      kind: 'inverter',
+      severity: inv.status,
+      titleKey: inv.cause === 'conversion' ? 'diag.inverter.conversionTitle' : 'diag.inverter.arrayTitle',
+      messageKey: inv.cause === 'conversion' ? 'diag.inverter.conversion' : 'diag.inverter.array',
       params: {
-        inverter: o.inverterId,
-        start: o.start,
-        minutes: Math.round((o.end - o.start) / MINUTE),
-        kwh: o.lostKwh.toFixed(1),
-        rs: (o.lostKwh * effectiveValuePerKwh(plant.economics)).toFixed(2),
+        inverter: inv.inverterId,
+        ac: Math.abs(inv.acDeviation * 100).toFixed(1),
+        dc: Math.abs(inv.dcDeviation * 100).toFixed(1),
       },
-      target: o.inverterId,
+      target: inv.inverterId,
     })
+  }
+
+  // Indisponibilidades: agrupa desarmes repetidos (assinatura de sobretensão na rede)
+  const recent = outages.filter((o) => o.end > now - 7 * DAY)
+  for (const invId of new Set(recent.map((o) => o.inverterId))) {
+    const list = recent.filter((o) => o.inverterId === invId)
+    const ongoing = list.find((o) => o.end >= now - 20 * MINUTE)
+    const lastDays = list.filter((o) => o.start >= today - 2 * DAY)
+    const kwh = list.reduce((a, o) => a + o.lostKwh, 0)
+    if (ongoing && ongoing.end - ongoing.start >= HOUR) {
+      diagnostics.push({
+        id: `outage-now-${invId}`,
+        kind: 'outage',
+        severity: 'critical',
+        titleKey: 'diag.outage.nowTitle',
+        messageKey: 'diag.outage.now',
+        params: { inverter: invId, start: ongoing.start, kwh: ongoing.lostKwh.toFixed(1), rs: (ongoing.lostKwh * value).toFixed(2) },
+        target: invId,
+      })
+    } else if (lastDays.length >= 2) {
+      const hours = lastDays.map((o) => localHour(o.start, plant.timezone))
+      const h = median(hours)
+      diagnostics.push({
+        id: `outage-recurrent-${invId}`,
+        kind: 'outage',
+        severity: lastDays.length >= 4 ? 'critical' : 'warning',
+        titleKey: 'diag.outage.recurrentTitle',
+        messageKey: 'diag.outage.recurrent',
+        params: {
+          inverter: invId,
+          count: lastDays.length,
+          hour: `${String(Math.floor(h)).padStart(2, '0')}:${String(Math.round((h % 1) * 60)).padStart(2, '0')}`,
+          kwh: kwh.toFixed(1),
+          rs: (kwh * value).toFixed(2),
+        },
+        target: invId,
+      })
+    } else {
+      for (const o of list) {
+        diagnostics.push({
+          id: `outage-${invId}-${o.start}`,
+          kind: 'outage',
+          severity: 'warning',
+          titleKey: 'diag.outage.title',
+          messageKey: 'diag.outage.message',
+          params: {
+            inverter: invId,
+            start: o.start,
+            minutes: Math.round((o.end - o.start) / MINUTE),
+            kwh: o.lostKwh.toFixed(1),
+            rs: (o.lostKwh * value).toFixed(2),
+          },
+          target: invId,
+        })
+      }
+    }
   }
 
   const todayExp = expected.filter((e) => e.t >= today && e.t < today + DAY)
@@ -302,5 +621,5 @@ export function buildDiagnostics(args: {
 
   const order: Record<Severity, number> = { critical: 0, warning: 1, info: 2, ok: 3 }
   diagnostics.sort((a, b) => order[a.severity] - order[b.severity])
-  return { diagnostics, daily, strings, soiling, outages }
+  return { diagnostics, daily, strings, inverters, soiling, outages, rainSoon, washed }
 }
